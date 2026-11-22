@@ -1,23 +1,31 @@
 package dev.minecontab;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.mojang.authlib.GameProfile;
 import com.mojang.authlib.properties.Property;
 import net.minecraft.client.network.PlayerListEntry;
 
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Base64;
 import java.util.Collection;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-/**
- * Reads the cape URL out of the "textures" property that the server already
- * sent in the player-info packet, and matches its hash against the Minecon capes.
- */
 public final class CapeDetector {
 
     public enum Minecon {
@@ -37,6 +45,17 @@ public final class CapeDetector {
     }
 
     private static final Map<UUID, Optional<Minecon>> CACHE = new ConcurrentHashMap<>();
+    private static final Map<String, Optional<Minecon>> LOOKUPS = new ConcurrentHashMap<>();
+    private static final Map<String, Long> FAILED = new ConcurrentHashMap<>();
+    private static final Set<String> PENDING = ConcurrentHashMap.newKeySet();
+
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5)).build();
+    private static final ExecutorService EXEC = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "minecontab-lookup");
+        t.setDaemon(true);
+        return t;
+    });
 
     private CapeDetector() {}
 
@@ -54,30 +73,99 @@ public final class CapeDetector {
         if (cached != null) return cached.orElse(null);
 
         Collection<Property> props = profile.properties().get("textures");
-        if (props == null || props.isEmpty()) {
-            return null; // profile not fully populated yet; try again next frame
+        boolean offlineUuid = id.version() == 3; // cracked / offline-mode servers
+
+        if (props != null && !props.isEmpty()) {
+            Minecon found = null;
+            for (Property p : props) {
+                Minecon m = fromTextureValue(p.value());
+                if (m != null) found = m;
+            }
+            if (found != null) {
+                CACHE.put(id, Optional.of(found));
+                return found;
+            }
+            if (!offlineUuid) {
+                CACHE.put(id, Optional.empty());
+                return null;
+            }
+        } else if (!offlineUuid) {
+            return null; // not populated yet, retry next frame
         }
 
-        Minecon result = null;
+        // Offline-mode UUID: the server may have stripped capes, so ask Mojang by name.
+        return viaMojang(profile.name());
+    }
+
+    private static Minecon fromTextureValue(String base64) {
         try {
-            for (Property p : props) {
-                String json = new String(Base64.getDecoder().decode(p.value()), StandardCharsets.UTF_8);
-                JsonObject textures = JsonParser.parseString(json).getAsJsonObject().getAsJsonObject("textures");
-                if (textures == null || !textures.has("CAPE")) continue;
-                String url = textures.getAsJsonObject("CAPE").get("url").getAsString();
-                String hash = url.substring(url.lastIndexOf('/') + 1);
-                for (Minecon m : Minecon.values()) {
-                    if (m.hash.equalsIgnoreCase(hash)) {
-                        result = m;
-                        break;
-                    }
-                }
+            String json = new String(Base64.getDecoder().decode(base64), StandardCharsets.UTF_8);
+            JsonObject textures = JsonParser.parseString(json).getAsJsonObject().getAsJsonObject("textures");
+            if (textures == null || !textures.has("CAPE")) return null;
+            String url = textures.getAsJsonObject("CAPE").get("url").getAsString();
+            String hash = url.substring(url.lastIndexOf('/') + 1);
+            for (Minecon m : Minecon.values()) {
+                if (m.hash.equalsIgnoreCase(hash)) return m;
             }
         } catch (Exception ignored) {
-            // malformed profile data: treat as "no Minecon cape"
         }
+        return null;
+    }
 
-        CACHE.put(id, Optional.ofNullable(result));
-        return result;
+    private static Minecon viaMojang(String name) {
+        if (name == null || name.isEmpty()) return null;
+        String key = name.toLowerCase(Locale.ROOT);
+
+        Optional<Minecon> done = LOOKUPS.get(key);
+        if (done != null) return done.orElse(null);
+
+        Long failedAt = FAILED.get(key);
+        if (failedAt != null && System.currentTimeMillis() - failedAt < 60_000) return null;
+
+        if (PENDING.add(key)) {
+            EXEC.execute(() -> {
+                try {
+                    LOOKUPS.put(key, Optional.ofNullable(fetch(name)));
+                    FAILED.remove(key);
+                } catch (Exception e) {
+                    FAILED.put(key, System.currentTimeMillis());
+                } finally {
+                    PENDING.remove(key);
+                    try { Thread.sleep(1100); } catch (InterruptedException ignored) {}
+                }
+            });
+        }
+        return null;
+    }
+
+    private static Minecon fetch(String name) throws Exception {
+        HttpResponse<String> r = get("https://api.minecraftservices.com/minecraft/profile/lookup/name/"
+                + URLEncoder.encode(name, StandardCharsets.UTF_8));
+        if (r.statusCode() == 404 || r.statusCode() == 204 || r.statusCode() == 400) return null;
+        if (r.statusCode() != 200) throw new IllegalStateException("status " + r.statusCode());
+        String uuid = JsonParser.parseString(r.body()).getAsJsonObject().get("id").getAsString();
+
+        Thread.sleep(1100);
+
+        r = get("https://sessionserver.mojang.com/session/minecraft/profile/" + uuid);
+        if (r.statusCode() == 404 || r.statusCode() == 204) return null;
+        if (r.statusCode() != 200) throw new IllegalStateException("status " + r.statusCode());
+
+        JsonArray arr = JsonParser.parseString(r.body()).getAsJsonObject().getAsJsonArray("properties");
+        if (arr == null) return null;
+        for (JsonElement el : arr) {
+            JsonObject o = el.getAsJsonObject();
+            if ("textures".equals(o.get("name").getAsString())) {
+                Minecon m = fromTextureValue(o.get("value").getAsString());
+                if (m != null) return m;
+            }
+        }
+        return null;
+    }
+
+    private static HttpResponse<String> get(String url) throws Exception {
+        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofSeconds(8)).GET().build();
+        return HTTP.send(req, HttpResponse.BodyHandlers.ofString());
     }
 }
